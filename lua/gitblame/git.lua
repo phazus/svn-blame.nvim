@@ -1,6 +1,12 @@
 local utils = require("gitblame.utils")
 local M = {}
 
+---@type table<string, boolean>
+local files_data_loading = {}
+
+---@type table<string, GitInfo>
+M.files_data = {}
+
 ---@param callback fun(is_ignored: boolean)
 function M.check_is_ignored(callback)
     local filepath = vim.api.nvim_buf_get_name(0)
@@ -178,6 +184,97 @@ local function get_current_branch(callback)
     })
 end
 
+---@param blames table[]
+---@param filepath string
+---@param lines string[]
+local function process_blame_output(blames, filepath, lines)
+    ---@type BlameInfo
+    local info
+    for _, line in ipairs(lines) do
+        local message = line:match("^([A-Za-z0-9]+) ([0-9]+) ([0-9]+) ([0-9]+)")
+        if message then
+            local parts = {}
+            for part in line:gmatch("%w+") do
+                table.insert(parts, part)
+            end
+
+            local startline = tonumber(parts[3])
+            info = {
+                startline = startline or 0,
+                sha = parts[1],
+                endline = startline + tonumber(parts[4]) - 1,
+            }
+
+            if parts[1]:match("^0+$") == nil then
+                for _, found_info in ipairs(blames) do
+                    if found_info.sha == parts[1] then
+                        info.author = found_info.author
+                        info.committer = found_info.committer
+                        info.date = found_info.date
+                        info.committer_date = found_info.committer_date
+                        info.summary = found_info.summary
+                        break
+                    end
+                end
+            end
+
+            table.insert(blames, info)
+        elseif info then
+            if line:match("^author ") then
+                local author = line:gsub("^author ", "")
+                info.author = author
+            elseif line:match("^author%-time ") then
+                local text = line:gsub("^author%-time ", "")
+                info.date = tonumber(text) or os.time()
+            elseif line:match("^committer ") then
+                local committer = line:gsub("^committer ", "")
+                info.committer = committer
+            elseif line:match("^committer%-time ") then
+                local text = line:gsub("^committer%-time ", "")
+                info.committer_date = tonumber(text) or os.time()
+            elseif line:match("^summary ") then
+                local text = line:gsub("^summary ", "")
+                info.summary = text
+            end
+        end
+    end
+
+    if not M.files_data[filepath] then
+        M.files_data[filepath] = { blames = {} }
+    end
+    M.files_data[filepath].blames = blames
+end
+
+---@return string
+local function get_date_format()
+    return vim.g.gitblame_date_format
+end
+
+---Checks if the date format contains a relative time placeholder.
+---@return boolean
+local function check_uses_relative_date()
+    if date_format_has_relative_time then
+        return date_format_has_relative_time
+    else
+        date_format_has_relative_time = get_date_format():match("%%r") ~= nil
+    end
+    return false
+end
+
+---@param date timestamp
+---@return string
+local function format_date(date)
+    local format = get_date_format()
+    if check_uses_relative_date() then
+        format = format:gsub("%%r", timeago.format(date))
+    end
+    if format == "*t" then
+        return "*t"
+    end
+    return os.date(format, date) --[[@as string]]
+end
+
+
 ---@param filepath string
 ---@param sha string?
 ---@param line1 number?
@@ -264,6 +361,98 @@ function M.get_repo_root(callback)
     local command = utils.make_local_command("git rev-parse --show-toplevel")
 
     utils.start_job(command, {
+        on_stdout = function(data)
+            callback(data[1])
+        end,
+    })
+end
+
+function M.load_blames(callback)
+    local blames = {}
+
+    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    if #lines == 0 then
+        return
+    end
+
+    local filepath = vim.api.nvim_buf_get_name(0)
+    if filepath == "" then
+        return
+    end
+
+    local buftype = vim.api.nvim_buf_get_option(0, "bt")
+    if buftype ~= "" then
+        return
+    end
+
+    local filetype = vim.api.nvim_buf_get_option(0, "ft")
+    if vim.tbl_contains(vim.g.gitblame_ignored_filetypes, filetype) then
+        return
+    end
+
+    if files_data_loading[filepath] then
+        return
+    end
+
+    files_data_loading[filepath] = true
+
+    M.get_repo_root(function(git_root)
+        local command = "git --no-pager -C "
+            .. vim.fn.shellescape(git_root)
+            .. " blame -b -p -w --date relative --contents - "
+            .. vim.fn.shellescape(filepath)
+
+        utils.start_job(command, {
+            input = table.concat(lines, "\n") .. "\n",
+            on_stdout = function(data)
+                process_blame_output(blames, filepath, data)
+                if callback then
+                    callback()
+                end
+            end,
+            on_exit = function()
+                files_data_loading[filepath] = nil
+            end,
+        })
+    end)
+end
+
+---@param info BlameInfo
+---@param template string
+---@return string formatted_message
+function M.format_blame_text(info, template)
+    local text = template
+    --utils.log(info)
+    text = text:gsub("<author>", info.author)
+    text = text:gsub("<committer>", info.committer)
+    text = text:gsub("<committer%-date>", format_date(info.committer_date))
+    text = text:gsub("<date>", format_date(info.date))
+
+    local summary_escaped = info.summary and info.summary:gsub("%%", "%%%%") or ""
+    text = text:gsub("<summary>", utils.truncate_description(summary_escaped, vim.g.gitblame_max_commit_summary_length))
+
+    text = text:gsub("<sha>", info.sha and string.sub(info.sha, 1, 7) or "")
+
+    return text
+end
+
+---@param callback fun(current_author: string)
+function M.find_current_author(callback)
+    utils.start_job("git config --get user.name", {
+        ---@param data string[]
+        on_stdout = function(data)
+            current_author = data[1]
+            if callback then
+                callback(current_author)
+            end
+        end,
+    })
+end
+
+---Returns SHA for the latest commit to the current branch.
+---@param callback fun(sha: string)
+function M.get_latest_sha(callback)
+    utils.start_job("git rev-parse HEAD", {
         on_stdout = function(data)
             callback(data[1])
         end,
