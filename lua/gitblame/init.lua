@@ -767,14 +767,14 @@ end
 local create_cmds = function()
     local command = vim.api.nvim_create_user_command
 
-    command("GitBlameToggle", M.toggle, {})
-    command("GitBlameEnable", M.enable, {})
-    command("GitBlameDisable", M.disable, {})
-    command("GitBlameOpenCommitURL", M.open_commit_url, {})
-    command("GitBlameOpenFileURL", M.open_file_url, { range = true })
-    command("GitBlameCopySHA", M.copy_sha_to_clipboard, {})
-    command("GitBlameCopyCommitURL", M.copy_commit_url_to_clipboard, {})
-    command("GitBlameCopyFileURL", M.copy_file_url_to_clipboard, { range = true })
+    command("GitBlameToggle", M.load().toggle, {})
+    command("GitBlameEnable", M.load().enable, {})
+    command("GitBlameDisable", M.load().disable, {})
+    command("GitBlameOpenCommitURL", M.load().open_commit_url, {})
+    command("GitBlameOpenFileURL", M.load().open_file_url, { range = true })
+    command("GitBlameCopySHA", M.load().copy_sha_to_clipboard, {})
+    command("GitBlameCopyCommitURL", M.load().copy_commit_url_to_clipboard, {})
+    command("GitBlameCopyFileURL", M.load().copy_file_url_to_clipboard, { range = true })
 end
 
 ---@class SetupOptions
@@ -804,6 +804,16 @@ M.setup = function(opts)
     else
         M.disable(true)
     end
+end
+
+M.load = function()
+    local ok, vcs = pcall(require, "gitblame." .. vim.g.vcs)
+    if not ok then
+        vim.notify("gitblame not supported for VCS " .. vim.g.vcs)
+        return
+    end
+    git = vcs
+    return M
 end
 
 return M
